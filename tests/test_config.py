@@ -33,3 +33,20 @@ def test_bad_generation_history_limit():
 def test_probe_path_is_normalized():
     assert load_config({"RELAY_PROBE_PATH": "ready"}).probe_path == "/ready"
     assert load_config({"RELAY_PROBE_PATH": "/healthz"}).probe_path == "/healthz"
+
+
+def test_verified_download_defaults_and_validation(tmp_path):
+    cfg = load_config({})
+    assert cfg.verified_max_bytes == 16 * 1024 * 1024
+    assert cfg.staging_dir is None
+    cfg = load_config(
+        {"RELAY_VERIFIED_MAX_BYTES": "1024", "RELAY_STAGING_DIR": str(tmp_path)}
+    )
+    assert cfg.verified_max_bytes == 1024
+    assert cfg.staging_dir == str(tmp_path)
+    with pytest.raises(ValueError):
+        load_config({"RELAY_VERIFIED_MAX_BYTES": "0"})
+    with pytest.raises(ValueError):
+        load_config({"RELAY_VERIFIED_MAX_BYTES": "nope"})
+    with pytest.raises(ValueError):
+        load_config({"RELAY_VERIFIED_MAX_BYTES": str(16 * 1024 * 1024 + 1)})

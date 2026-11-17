@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
-from typing import Iterable
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request
@@ -14,41 +13,17 @@ from pydantic import BaseModel, Field
 from starlette.types import Receive, Scope, Send
 
 from .config import Config
-from .generations import Generation, HOP_BY_HOP, InFlightRequest, RelayState
+from .generations import Generation, InFlightRequest, RelayState
+from .http_utils import (
+    DROP_RESPONSE_HEADERS,
+    JSON_HEADERS,
+    header_pairs,
+    strip_hop_by_hop,
+    watch_disconnect,
+)
+from .verified import VerifiedDownload
 
 log = logging.getLogger("relay.proxy")
-
-JSON_HEADERS = {"cache-control": "no-store", "x-content-type-options": "nosniff"}
-# Response headers that describe the upstream hop, not the payload.  ``date``
-# and ``server`` are dropped as well: uvicorn emits its own, and duplicates
-# would make the relay's own identity ambiguous.
-DROP_RESPONSE_HEADERS = HOP_BY_HOP | {
-    "connection",
-    "keep-alive",
-    "content-length",
-    "transfer-encoding",
-    "trailer",
-    "upgrade",
-    "date",
-    "server",
-}
-
-
-def _header_pairs(raw_headers: Iterable[tuple[bytes, bytes]]) -> list[tuple[str, str]]:
-    return [(k.decode("latin-1"), v.decode("latin-1")) for k, v in raw_headers]
-
-
-def _connection_tokens(headers: list[tuple[str, str]]) -> set[str]:
-    tokens: set[str] = set()
-    for name, value in headers:
-        if name.lower() == "connection":
-            tokens.update(part.strip().lower() for part in value.split(",") if part.strip())
-    return tokens
-
-
-def _strip_hop_by_hop(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    drop = set(HOP_BY_HOP) | _connection_tokens(headers)
-    return [(k, v) for k, v in headers if k.lower() not in drop]
 
 
 def _target_url(generation: Generation, scope: Scope) -> str:
@@ -72,6 +47,7 @@ class RelayApp:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.state = RelayState(config)
+        self.verified = VerifiedDownload(self)
         self.app = self._build()
 
     # -- lifespan -----------------------------------------------------------
@@ -118,8 +94,10 @@ class RelayApp:
                 "`RELAY_DRAIN_SECONDS` (default 5s); when the window expires only that "
                 "generation's unfinished requests are interrupted. Requests on newer "
                 "generations are untouched.\n"
-                "* Response bodies are forwarded chunk by chunk, never buffered whole.\n\n"
-                "Open **GET /demo** for a click-through download demo."
+                "* Response bodies are forwarded chunk by chunk, never buffered whole.\n"
+                "* `GET|POST /api/verified-download` stages the upstream artifact, checks "
+                "its SHA-256, and only then sends the bytes. A failed check never leaks "
+                "artifact bytes; verification and delivery both count as in-flight."
             ),
             lifespan=self.lifespan,
         )
@@ -129,6 +107,9 @@ class RelayApp:
         app.get("/api/operations/{operation_id}", tags=["relay"])(self.api_operation)
         app.get("/demo", response_class=HTMLResponse, tags=["demo"])(self.demo_page)
         app.get("/", response_class=HTMLResponse, tags=["demo"])(self.demo_page)
+        # Verified downloads are specific paths, registered before the GET
+        # catch-all; ordinary GET/HEAD proxying is unchanged.
+        self.verified.register_routes(app)
         # The GET catch-all must be registered last.
         app.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)(self.proxy_get)
         return app
@@ -189,14 +170,14 @@ class RelayApp:
 
         request_headers = [
             (k, v)
-            for k, v in _strip_hop_by_hop(_header_pairs(scope.get("headers", [])))
+            for k, v in strip_hop_by_hop(header_pairs(scope.get("headers", [])))
             if k.lower() not in ("host", "content-length")
         ]
         url = _target_url(generation, scope)
 
         disconnect_event = asyncio.Event()
         disconnect_task = asyncio.create_task(
-            _watch_disconnect(request.receive, disconnect_event),
+            watch_disconnect(request.receive, disconnect_event),
             name=f"relay-disconnect-{in_flight.id}",
         )
         abort_wait = asyncio.ensure_future(in_flight.event.wait())
@@ -238,7 +219,7 @@ class RelayApp:
 
             response_headers = [
                 (k, v)
-                for k, v in _strip_hop_by_hop(list(upstream_response.headers.items()))
+                for k, v in strip_hop_by_hop(list(upstream_response.headers.items()))
                 if k.lower() not in DROP_RESPONSE_HEADERS and not k.lower().startswith("x-relay-")
             ]
             # Body framing is ours. If upstream declared a length we pass it on
@@ -314,25 +295,6 @@ class RelayApp:
             status_code=status,
             headers={**JSON_HEADERS, "x-relay-generation": str(generation.id)},
         )
-
-
-async def _watch_disconnect(receive: Receive, event: asyncio.Event) -> None:
-    """Set ``event`` when the client disconnects; runs for the response lifetime.
-
-    Uvicorn delivers ``http.disconnect`` only through ``receive()``; there is no
-    other signal for an aborted download, so this task is what frees the
-    upstream connection when the client goes away.
-    """
-    try:
-        while not event.is_set():
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                event.set()
-                return
-    except asyncio.CancelledError:
-        raise
-    except Exception:  # pragma: no cover - defensive
-        event.set()
 
 
 class StreamingUpstreamResponse(Response):
@@ -503,6 +465,18 @@ DEMO_HTML = """<!doctype html>
   <tbody id="generations"></tbody>
 </table>
 
+<h2>Verified download</h2>
+<p>Staged and SHA-256 checked before the first artifact byte is sent. The digest
+  is published by the upstream (<code>/verified/manifest</code>).</p>
+<div class="row">
+  <input id="vseed" value="demo" size="8" title="seed">
+  <input id="vbytes" type="number" value="65536" min="0" max="16777216" title="bytes">
+  <input id="vdigest" placeholder="expected sha256 (auto-filled)" size="70">
+  <button onclick="fetchManifest()">Get digest</button>
+  <button onclick="verifiedDownload()">Verified download</button>
+  <span id="vmsg" class="muted"></span>
+</div>
+
 <h2>Download demo</h2>
 <p>Links go through the relay at its current target. Start a slow download, then switch.</p>
 <div class="row">
@@ -527,6 +501,33 @@ async function refresh() {
       `<tr><td>${g.id}</td><td>${g.target}</td><td>${g.state}</td><td>${g.in_flight}</td>` +
       `<td>${g.drain_remaining_seconds ?? ''}</td></tr>`).join('');
   } catch (e) { /* transient */ }
+}
+async function fetchManifest() {
+  const seed = document.getElementById('vseed').value;
+  const bytes = document.getElementById('vbytes').value;
+  // The manifest is fetched directly from the current target via the relay's
+  // plain proxy path, so the digest always matches the artifact served there.
+  const r = await fetch(`/verified/manifest?seed=${encodeURIComponent(seed)}&bytes=${bytes}`);
+  const j = await r.json();
+  document.getElementById('vdigest').value = j.sha256;
+  document.getElementById('vmsg').textContent = `upstream ${j.upstream}: ${j.bytes} bytes`;
+}
+async function verifiedDownload() {
+  const seed = document.getElementById('vseed').value;
+  const bytes = document.getElementById('vbytes').value;
+  const sha = document.getElementById('vdigest').value;
+  document.getElementById('vmsg').textContent = 'verifying… (no bytes are sent until the digest matches)';
+  try {
+    const r = await fetch('/api/verified-download?path=' +
+      encodeURIComponent(`/verified/artifact?seed=${seed}&bytes=${bytes}`) +
+      '&sha256=' + encodeURIComponent(sha));
+    const len = (await r.arrayBuffer()).byteLength;
+    document.getElementById('vmsg').textContent =
+      `${r.status} ${len} bytes, target=${r.headers.get('x-relay-target')} ` +
+      `sha256=${r.headers.get('x-relay-sha256')}`;
+  } catch (e) {
+    document.getElementById('vmsg').textContent = 'failed: ' + e;
+  }
 }
 async function switchTo(target) {
   document.getElementById('switch-msg').textContent = `probing ${target}…`;

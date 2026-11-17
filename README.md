@@ -26,6 +26,11 @@
 | 慢探活不挡切换/查询 | 探活是独立任务，`POST /api/switch` 默认立刻返回 202（`wait=true` 才阻塞，且可设超时）；`/api/status` 是纯同步快照，不取锁、不 await 任何网络 |
 | 慢下载不挡切换/查询 | 探活与代理使用**两个独立的 aiohttp session/连接池**；控制面不等待任何下载 |
 | `/docs` 可切换、查目标与各代在途数 | OpenAPI 见 `/docs`；`GET /api/status` 返回当前目标/代、各代状态与 `in_flight`、进行中的请求明细；`/demo` 是可视化演示页 |
+| 核验下载：只下发整包、核验通过才发首字节 | `GET|POST /api/verified-download` 把上游响应逐块写入临时文件并同时算 SHA-256；**匹配后**才发响应头和文件。不通过时不发任何制品字节，只回 JSON 错误并删除暂存文件 |
+| 核验下载固定受理时的目标 | 与其他请求相同：在第一个 `await` 之前同步读取 `state.current` 并登记为 `kind="verified-download"` 的在途请求 |
+| 核验下载只接受完整 200、单件 ≤16 MiB | 非 200（含 3xx）→ `502 upstream_status`（不转发上游错误体）；`Content-Length` 超限立即 `413`，无长度时边读边计数、超限即停 + `413`；上游提前断流 → `502 upstream_truncated` |
+| 核验与下发都算在途；切流后旧代 5 秒到期 | 暂存阶段和下发阶段共用同一个 `InFlightRequest`/abort 事件；drain 到期会中止核验（未发头 → `503 generation_draining`）或截断下发（不发最终 body 帧，客户端看到不完整传输） |
+| 客户端断连停止并清暂存 | 断开信号同时参与暂存读、文件发两处的等待；所有退出路径都 unlink 暂存文件，未发完的部分绝不当作完成 |
 
 补充约定：
 
@@ -45,8 +50,8 @@ docker compose up --build
 
 | 地址 | 内容 |
 | --- | --- |
-| http://localhost:8080/docs | 切换 API、状态查询 |
-| http://localhost:8080/demo | 演示页（切换按钮 + 代/在途数 + 下载链接） |
+| http://localhost:8080/docs | 切换 API、状态查询、核验下载 API |
+| http://localhost:8080/demo | 演示页（切换按钮 + 代/在途数 + 下载链接 + 核验下载） |
 | http://localhost:8080/api/status | 当前目标、各代状态/在途数、最近操作 |
 | http://localhost:9001 | blue 上游（直连，用于调探活） |
 | http://localhost:9002 | green 上游（直连，用于调探活） |
@@ -78,6 +83,12 @@ curl http://localhost:8080/api/status | python3 -m json.tool
 脚本读 `RELAY` 环境变量，默认 `http://localhost:8080`（本地手跑时用
 `RELAY=http://127.0.0.1:<port> ./demo/download.sh`）。
 
+核验下载演示：
+
+```bash
+./demo/verified_download.sh   # 取摘要 → 核验下发 → 错摘要 422 → 404 上游 502 → 切流中止
+```
+
 ### 手动跑两个可控上游（不用 docker）
 
 ```bash
@@ -104,6 +115,8 @@ RELAY_TARGETS='blue=http://127.0.0.1:9001,green=http://127.0.0.1:9002' \
 | `RELAY_HOST` / `RELAY_PORT` | `0.0.0.0` / `8080` | 监听地址 |
 | `RELAY_SHUTDOWN_GRACE_SECONDS` | `5` | 退出时等长下载收尾的上限，超时后强制断开并 abort 所有代 |
 | `RELAY_MAX_CLOSED_GENERATIONS` | `100` | 状态里保留的已关闭代数（活跃/收尾中的代永远不会被裁掉） |
+| `RELAY_VERIFIED_MAX_BYTES` | `16777216` | 核验下载单件上限；默认且最大为 16 MiB，只能调低（调高会在启动时报错）；超限 `413` |
+| `RELAY_STAGING_DIR` | 系统临时目录 | 核验暂存目录；每件一个 `mkstemp` 唯一文件（0600），不共享缓存 |
 
 ## 控制面 API
 
@@ -116,6 +129,66 @@ RELAY_TARGETS='blue=http://127.0.0.1:9001,green=http://127.0.0.1:9002' \
   `in_flight_requests[]`）、`recent_operations[]`（最近 50 次）。
 * `GET /api/operations/{id}` — 单次切换的最终状态。
 * `GET /api/targets` — 目标表 + 当前目标。
+
+## 核验下载 API
+
+`GET|POST /api/verified-download`（别名 `GET|POST /api/download`，仅 GET/POST，不占用普通
+GET 路径；别名不出现在 `/docs`，避免重复条目）。
+
+参数：
+
+| 名称 | 位置 | 说明 |
+| --- | --- | --- |
+| `path` | query / JSON body | 上游相对路径，**可带查询串**。必须相对（拒绝 `//host`、`scheme://`、控制字符）；不带前导 `/` 时会补上 |
+| `sha256` | query / JSON body | 期望的 SHA-256：64 位十六进制，大小写均可，可带 `sha256:` / `sha256=` 前缀 |
+
+```bash
+# 演示上游会公布确定性制品的摘要
+DIGEST=$(curl -sS 'http://localhost:8080/verified/manifest?seed=demo&bytes=1048576' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha256"])')
+
+curl -sS -D - -o /tmp/artifact.bin \
+  "http://localhost:8080/api/verified-download?path=%2Fverified%2Fartifact%3Fseed%3Ddemo%26bytes%3D1048576&sha256=$DIGEST"
+# 或者 POST:
+curl -sS -o /tmp/artifact.bin http://localhost:8080/api/verified-download \
+  -H 'content-type: application/json' \
+  -d "{\"path\":\"/verified/artifact?seed=demo&bytes=1048576\",\"sha256\":\"$DIGEST\"}"
+```
+
+成功的响应带 `x-relay-verified: sha256`、`x-relay-sha256`、`x-relay-target`、
+`x-relay-generation`，并给出准确的 `content-length`。其他结果：
+
+| 情况 | 状态码 | `error` |
+| --- | --- | --- |
+| 必需参数缺失（GET query / POST body 结构错） | `422` | FastAPI 校验详情 |
+| 参数存在但非法（空、非 64 位十六进制、绝对 URL、控制字符） | `400` | `detail` |
+| 上游非 200（3xx 不跟随） | `502` | `upstream_status` |
+| 上游带非 identity `Content-Encoding` | `502` | `upstream_encoding` |
+| 连接失败 / 上游读超时 | `502` / `504` | `upstream_error` / `upstream_timeout` |
+| 声明长度或实际流量超 16 MiB | `413` | `artifact_too_large` |
+| 上游提前断流或少于声明长度 | `502` | `upstream_truncated` |
+| SHA-256 不符 | `422` | `digest_mismatch`（含 `expected_sha256` / `actual_sha256`） |
+| 代 drain 到期（暂存中/下发前） | `503` | `generation_draining` |
+| 代 drain 到期（下发中） | 已发 `200`，随后截断、无最终帧 | 客户端看到不完整传输（如 `curl: (18)`） |
+| 客户端断连 | `499`（未发头时） | `client_disconnected` |
+
+语义要点：
+
+* **核验通过前不发任何响应头**。客户端在暂存/核验期间收不到 `200`；失败时收到的只有
+  JSON 错误，不包含制品字节，暂存文件随即删除。
+* 暂存是**逐块写临时文件**，不把整件读进内存（哈希也是逐块更新）；文件在全部退出路径上
+  都会删除。下发时先打开文件再立即 unlink 文件名，因此下发期间磁盘上也不留制品副本，
+  进程崩溃/断连也不会残留（文件名唯一、0600）。
+* 请求侧会去掉 `Range`/条件请求/`Accept-Encoding` 等头并强制 `identity`，保证核验的是
+  将要下发的整包字节；上游响应 `Content-Length` 与实际字节数不一致按断流处理。
+* 核验与下发是**同一个在途请求**：`/api/status` 里 `kind == "verified-download"`，
+  `detail` 依次显示 `fetching` / `verifying` / `delivering` 与 `bytes_staged`。切流后旧代
+  满 5 秒会中止正在核验的请求（`503`）或截断正在下发的文件；截断时不发最终 body 帧，
+  客户端只会看到不完整传输，不会误以为整包下载完成。
+* 每次请求独立暂存，没有跨请求的“下载缓存”或命中判断 —— 需要缓存请放在上游。
+* 演示上游的 `/verified/artifact` 字节只由 `(seed, bytes)` 决定（与分块大小、上游名无关），
+  `/verified/manifest` 发布其摘要，因此切到 blue/green 任一侧都能核验同一份清单；
+  `/verified/broken` 模拟“声明长度但提前断流”。
 
 ## 设计要点（为什么这么做）
 
@@ -131,6 +204,12 @@ RELAY_TARGETS='blue=http://127.0.0.1:9001,green=http://127.0.0.1:9002' \
   `ERROR: ASGI callable returned without completing response` —— 这是被中断下载的预期日志。
 * 上游自己返回的 `x-relay-*` 响应头会被剥掉，避免伪造路由标记。
 * 上游返回的 `date`/`server` 也被剥掉，由 uvicorn 生成，避免出现两个同名响应头。
+* **核验下载为什么先落盘**：只有“先完整拿到 + 校验”才能保证 200 响应头之后一定是正确整包；
+  若边转发边校验，摘要不符时客户端已经收到部分字节。落盘用 `mkstemp` 的唯一文件，
+  下发前 unlink 文件名、保留已打开的描述符，既避免残留，也不占额外内存。
+  核验请求复用普通代理的同一个上游连接池与代（epoch）机制，因此切流/在途计数/5 秒
+  收尾的语义与普通下载完全一致。核验读块、文件读写都通过 `asyncio.to_thread` 让出事件循环，
+  慢磁盘不挡切换/状态查询。
 
 ## 测试
 
@@ -142,3 +221,8 @@ python -m pytest -q
 `tests/` 分两层：`test_switch_unit.py` 用假探活 session 覆盖状态机（失败保留、supersede、
 迟到 200、drain 只作用于本代、回切同址、no-op）；`test_proxy_integration.py` 起真实
 TCP 上游 + relay，覆盖逐块转发、长连接重路由、在途计数、5 秒截断、502/404、断开清理等。
+`test_verified_download.py` 覆盖核验下载：成功整包、GET/POST、别名、摘要大小写与前缀、
+错摘要 `422` 无字节、非 200/重定向 `502`、声明/流式超限 `413`、断流 `502`、暂存清理、
+核验中切流 `503`、下发中 drain 截断、客户端断连（核验/下发两阶段）清理、并发独立暂存、
+零字节与恰好等于上限、慢核验不挡切换/查询、HEAD 不落到上游；`test_verified_unit.py`
+覆盖路径与摘要参数校验。

@@ -35,13 +35,20 @@ HOP_BY_HOP = frozenset(
 
 @dataclass
 class InFlightRequest:
-    """One GET pinned to a generation.  ``event`` is its abort signal."""
+    """One request pinned to a generation.  ``event`` is its abort signal.
+
+    A verified download is a single in-flight request from the moment it is
+    accepted: staging/verification and delivery both count, and both observe
+    the same abort signal.
+    """
 
     id: int
     path: str
     started_at: float
+    kind: str = "get"  # "get" (streamed proxy) | "verified-download"
     event: asyncio.Event = field(default_factory=asyncio.Event)
     abort_reason: str | None = None
+    detail: dict[str, Any] = field(default_factory=dict)
 
     def abort(self, reason: str) -> None:
         if self.abort_reason is None:
@@ -52,9 +59,11 @@ class InFlightRequest:
         return {
             "id": self.id,
             "path": self.path,
+            "kind": self.kind,
             "started_at": self.started_at,
             "age_seconds": round(time.time() - self.started_at, 3),
             "abort_reason": self.abort_reason,
+            "detail": dict(self.detail),
         }
 
 
@@ -73,9 +82,9 @@ class Generation:
     _aborted: bool = False
     on_idle: Callable[["Generation"], None] | None = None
 
-    def register(self, path: str) -> InFlightRequest:
+    def register(self, path: str, kind: str = "get") -> InFlightRequest:
         self._request_seq += 1
-        req = InFlightRequest(id=self._request_seq, path=path, started_at=time.time())
+        req = InFlightRequest(id=self._request_seq, path=path, started_at=time.time(), kind=kind)
         self.requests[req.id] = req
         if self._aborted:
             req.abort("drain_expired")

@@ -23,6 +23,10 @@ services:
       RELAY_DRAIN_SECONDS: "5"
       RELAY_CHUNK_SIZE: "65536"
       RELAY_LOG_LEVEL: "INFO"
+      # Digest-verified downloads: staging is per-request (unique temp file),
+      # never a shared cache, and never read back whole into memory.
+      RELAY_VERIFIED_MAX_BYTES: "16777216"
+      RELAY_STAGING_DIR: "/var/tmp/relay-staging"
     ports:
       - "8080:8080"
     depends_on:

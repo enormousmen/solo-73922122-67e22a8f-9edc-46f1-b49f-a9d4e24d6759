@@ -28,6 +28,8 @@ class Config:
     host: str
     port: int
     max_closed_generations: int = 100
+    verified_max_bytes: int = 16 * 1024 * 1024
+    staging_dir: str | None = None
 
 
 def _parse_targets(raw: str) -> dict[str, Target]:
@@ -95,6 +97,14 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     max_closed = int(e.get("RELAY_MAX_CLOSED_GENERATIONS", "100"))
     if max_closed < 1:
         raise ValueError("RELAY_MAX_CLOSED_GENERATIONS must be >= 1")
+    verified_max = int(e.get("RELAY_VERIFIED_MAX_BYTES", str(16 * 1024 * 1024)))
+    if verified_max <= 0:
+        raise ValueError("RELAY_VERIFIED_MAX_BYTES must be > 0")
+    if verified_max > 16 * 1024 * 1024:
+        # The product limit is one 16 MiB artifact per request; the knob may
+        # only lower it (e.g. for constrained deployments).
+        raise ValueError("RELAY_VERIFIED_MAX_BYTES must be <= 16777216 (16 MiB)")
+    staging_dir = e.get("RELAY_STAGING_DIR") or None
     probe_path = e.get("RELAY_PROBE_PATH", "/ready")
     if not probe_path.startswith("/"):
         probe_path = "/" + probe_path
@@ -110,4 +120,6 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         host=e.get("RELAY_HOST", "0.0.0.0"),
         port=int(e.get("RELAY_PORT", "8080")),
         max_closed_generations=max_closed,
+        verified_max_bytes=verified_max,
+        staging_dir=staging_dir,
     )
